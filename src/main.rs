@@ -2,13 +2,20 @@ mod models;
 mod schema;
 mod utils;
 
+use clokwerk::{Scheduler, TimeUnits};
 use regex::Regex;
-use rocket::http::Status;
+use rocket::http::{Header, Status};
 use rocket::response::status::Custom;
+use rocket::State;
+use serde::Serialize;
+use utils::files::{create_storage_client, put_object};
 use utils::id::gen_id;
 use utils::log::setup_logger;
 use utils::rate_limit::RateLimitConfig;
 
+use dotenv::dotenv;
+
+use std::env;
 use std::result::Result;
 use std::result::Result::Ok;
 use std::string::String;
@@ -17,12 +24,12 @@ use std::time::Duration;
 use rocket::form::Form;
 use rocket::serde::json::Json;
 
-use utils::db;
+use utils::db::{self, collect_garbage};
 
 use crate::utils::rate_limit::RateLimiter;
 use crate::utils::structs::{APIResponse, APIStatus};
 
-use git2::Repository;
+use aws_sdk_s3::Client;
 
 extern crate rand;
 extern crate serde;
@@ -32,6 +39,61 @@ extern crate serde_json;
 extern crate rocket;
 extern crate fern;
 extern crate log;
+
+include!(concat!(env!("OUT_DIR"), "/git_commit.rs"));
+#[derive(rocket::FromForm, serde::Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct UploadQuery {
+    name: String,
+    size: Option<usize>,
+}
+
+#[get("/upload-file?<query..>")]
+async fn upload_file(
+    _rate_limiter: RateLimiter,
+    s3_client: &State<Client>,
+    query: UploadQuery,
+) -> Result<Json<APIResponse>, Custom<Json<APIResponse>>> {
+    if query.name.is_empty() {
+        let response = APIResponse {
+            status: APIStatus::Error,
+            result: "File name is empty".to_string(),
+        };
+        return Err(Custom(Status::BadRequest, Json(response)));
+    }
+
+    let max_size = 100 * 1024 * 1024; // 100MB
+    if let Some(size) = query.size {
+        if size > max_size {
+            let response = APIResponse {
+                status: APIStatus::Error,
+                result: "File is too large".to_string(),
+            };
+            return Err(Custom(Status::PayloadTooLarge, Json(response)));
+        }
+    }
+
+    let bucket = "iclip";
+    let object_key = format!("{}/{}", gen_id(10), query.name);
+
+    match put_object(s3_client, bucket, &object_key, 60).await {
+        Ok(presigned_url) => {
+            let response = APIResponse {
+                status: APIStatus::Success,
+                result: presigned_url,
+            };
+            Ok(Json(response))
+        }
+        Err(err) => {
+            error!("{}", err);
+            let response = APIResponse {
+                status: APIStatus::Error,
+                result: "A server-side problem has occurred".to_string(),
+            };
+            Err(Custom(Status::InternalServerError, Json(response)))
+        }
+    }
+}
 
 #[get("/status")]
 fn status(_rate_limiter: RateLimiter) -> Result<Json<APIResponse>, Custom<Json<APIResponse>>> {
@@ -47,10 +109,10 @@ fn status(_rate_limiter: RateLimiter) -> Result<Json<APIResponse>, Custom<Json<A
         }
     };
 
-    let code = "test".to_string();
     let url = "https://github.com".to_string();
 
-    if let Err(e) = db::insert_clip(&mut db_connection, url, code.clone()) {
+    let insert_result = db::insert_clip(&mut db_connection, url);
+    if let Err(e) = insert_result {
         error!("{}", e);
         let response = APIResponse {
             status: APIStatus::Error,
@@ -59,7 +121,7 @@ fn status(_rate_limiter: RateLimiter) -> Result<Json<APIResponse>, Custom<Json<A
         return Err(Custom(Status::InternalServerError, Json(response)));
     }
 
-    let result = db::get_clip(&mut db_connection, code);
+    let result = db::get_clip(&mut db_connection, insert_result.unwrap().code);
 
     match result {
         Ok(_) => {
@@ -79,17 +141,6 @@ fn status(_rate_limiter: RateLimiter) -> Result<Json<APIResponse>, Custom<Json<A
             Err(Custom(Status::InternalServerError, Json(response)))
         }
     }
-}
-
-#[get("/set")]
-fn set_clip_get() -> Result<Json<APIResponse>, Custom<Json<APIResponse>>> {
-    Err(Custom(
-        Status::MethodNotAllowed,
-        Json(APIResponse {
-            status: APIStatus::Error,
-            result: "For creating clips, only POST is allowed".to_string(),
-        }),
-    ))
 }
 
 #[catch(429)]
@@ -113,7 +164,7 @@ struct SetClipRequest {
     url: String,
 }
 
-#[post("/set", data = "<form_data>")]
+#[post("/clip", data = "<form_data>")]
 fn set_clip(
     form_data: Form<SetClipRequest>,
     _rate_limiter: RateLimiter,
@@ -179,13 +230,12 @@ fn set_clip(
         return Err(Custom(Status::InternalServerError, Json(response)));
     }
 
-    let code = gen_id(5);
-    let result = db::insert_clip(&mut db_connection, url.to_string(), code.clone());
+    let result = db::insert_clip(&mut db_connection, url.to_string());
     match result {
         Ok(_) => {
             let response = APIResponse {
                 status: APIStatus::Success,
-                result: code,
+                result: result.unwrap().code,
             };
             Ok(Json(response))
         }
@@ -200,7 +250,7 @@ fn set_clip(
     }
 }
 
-#[get("/get?<code>")]
+#[get("/clip?<code>")]
 fn get_clip(
     code: String,
     _rate_limiter: RateLimiter,
@@ -261,7 +311,7 @@ fn get_clip(
     }
 }
 
-#[get("/get")]
+#[get("/clip")]
 fn get_clip_empty() -> Result<Custom<Json<APIResponse>>, Custom<Json<APIResponse>>> {
     Err(Custom(
         Status::BadRequest,
@@ -272,6 +322,46 @@ fn get_clip_empty() -> Result<Custom<Json<APIResponse>>, Custom<Json<APIResponse
     ))
 }
 
+#[derive(Serialize)]
+struct StatsResponse {
+    total_clips: serde_json::Value,
+}
+
+#[get("/stats")]
+fn get_service_stats(
+    _rate_limiter: RateLimiter,
+) -> Result<Custom<Json<StatsResponse>>, Custom<Json<APIResponse>>> {
+    let mut db_connection = match db::initialize() {
+        Ok(conn) => conn,
+        Err(err) => {
+            error!("{}", err);
+            let response = APIResponse {
+                status: APIStatus::Error,
+                result: "A problem with the database has occurred".to_string(),
+            };
+            return Err(Custom(Status::InternalServerError, Json(response)));
+        }
+    };
+
+    let stats = db::get_total_clip_count(&mut db_connection);
+    match stats {
+        Ok(stats) => {
+            let response = StatsResponse {
+                total_clips: serde_json::to_value(stats).unwrap(),
+            };
+            Ok(Custom(Status::Ok, Json(response)))
+        }
+        Err(e) => {
+            error!("{}", e);
+            let response = APIResponse {
+                status: APIStatus::Error,
+                result: "A problem with the database has occurred".to_string(),
+            };
+            Err(Custom(Status::InternalServerError, Json(response)))
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct Version {
     commit: Option<String>,
@@ -279,29 +369,15 @@ struct Version {
 
 #[get("/version")]
 fn version(_rate_limiter: RateLimiter) -> Json<Version> {
-    let repo = Repository::discover(".");
-    let commit = match repo {
-        Ok(r) => {
-            let head = r.head();
-            match head {
-                Ok(reference) => {
-                    let peeling = reference.peel_to_commit();
-                    match peeling {
-                        Ok(commit) => Some(format!("{}", commit.id())),
-                        Err(_) => None,
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        Err(_) => None,
-    };
-
-    Json(Version { commit })
+    Json(Version {
+        commit: Some(GIT_COMMIT.to_string()),
+    })
 }
 
 #[launch]
 async fn rocket() -> _ {
+    dotenv().ok();
+
     match setup_logger() {
         Ok(path) => {
             println!("Logger setup at {}", path);
@@ -314,14 +390,8 @@ async fn rocket() -> _ {
     let rate_limiter = RateLimiter::new();
     rate_limiter
         .add_config(
-            "/api/get",
-            RateLimitConfig::new(Duration::from_secs(30), 100),
-        )
-        .await;
-    rate_limiter
-        .add_config(
-            "/api/set",
-            RateLimitConfig::new(Duration::from_secs(60), 20),
+            "/api/clip",
+            RateLimitConfig::new(Duration::from_secs(30), 50),
         )
         .await;
     rate_limiter
@@ -330,6 +400,20 @@ async fn rocket() -> _ {
             RateLimitConfig::new(Duration::from_secs(30), 20),
         )
         .await;
+    rate_limiter
+        .add_config(
+            "/api/stats",
+            RateLimitConfig::new(Duration::from_secs(30), 100),
+        )
+        .await;
+
+    let s3_client = create_storage_client().await.unwrap();
+
+    let mut db_connection = db::initialize().expect("Failed to connect to the database");
+    let mut scheduler = Scheduler::with_tz(chrono::Utc);
+    scheduler.every(1.hour()).run(move || {
+        let _ = collect_garbage(&mut db_connection);
+    });
 
     rocket::build()
         .mount(
@@ -339,10 +423,18 @@ async fn rocket() -> _ {
                 get_clip,
                 get_clip_empty,
                 set_clip,
-                set_clip_get,
-                version
+                version,
+                get_service_stats,
+                upload_file
             ],
         )
         .register("/", catchers![too_many_requests, not_found])
         .manage(rate_limiter)
+        .attach(rocket::fairing::AdHoc::on_response("Headers", |_, res| {
+            Box::pin(async move {
+                // CORS headers
+                res.set_header(Header::new("Access-Control-Allow-Origin", "*"));
+            })
+        }))
+        .manage(s3_client)
 }
